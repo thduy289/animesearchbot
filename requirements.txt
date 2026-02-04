@@ -1,5 +1,4 @@
 discord.py
 aiohttp
 python-dotenv
-notion-client
 flask
