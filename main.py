@@ -8,18 +8,36 @@ from discord import app_commands
 from discord.ext import tasks
 from discord.ui import View, Select
 from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
 
-# Bot sẽ tự tìm Token trong hệ thống Environment Variable của Discloud
-load_dotenv() 
+# --- CẤU HÌNH ---
+load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 NOTION_TOKEN = os.getenv('NOTION_TOKEN')
 DATABASE_ID = os.getenv('NOTION_DATABASE_ID')
-WEB_BASE_URL = "https://rmbd.onrender.com"
+# WEB_BASE_URL: Sau khi deploy xong trên Render, bạn thay link web vào đây
+WEB_BASE_URL = "https://rmbd.onrender.com" 
 CHANNEL_ID = os.getenv('CHANNEL_ID')
 CACHE_FILE = "cache.json"
 
 intents = discord.Intents.default()
 intents.message_content = True 
+
+# --- KEEP ALIVE (TRÁI TIM CỦA BOT TRÊN RENDER) ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is Alive! Running 24/7."
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+# ------------------------------------------------
 
 # --- QUẢN LÝ CACHE ---
 def load_cache():
@@ -40,8 +58,6 @@ class MyClient(discord.Client):
     async def on_ready(self):
         print(f'Bot đã online: {self.user}')
         await self.tree.sync()
-        
-        # Nếu chưa có cache -> Chạy đồng bộ lần đầu để không spam
         if not os.path.exists(CACHE_FILE):
             print("⚠️ Chạy lần đầu: Đang đồng bộ dữ liệu...")
             await sync_initial_data()
@@ -54,7 +70,7 @@ class MyClient(discord.Client):
 
 client = MyClient()
 
-# --- LOGIC NOTION (Pagination & Fetch) ---
+# --- LOGIC NOTION (Pagination) ---
 async def fetch_notion(payload):
     url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
     headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
@@ -64,7 +80,6 @@ async def fetch_notion(payload):
             return await resp.json()
 
 async def fetch_all_pages(filter_payload=None):
-    """Hàm lấy toàn bộ dữ liệu (không bị giới hạn 100 dòng)"""
     url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
     headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
     results = []
@@ -126,63 +141,45 @@ async def create_anime_embed(page, web_link):
     return embed
 
 async def sync_initial_data():
-    """Chạy lần đầu để nhớ hết các phim đang có"""
     payload = {"filter": {"property": "Public", "checkbox": {"equals": True}}}
     all_pages = await fetch_all_pages(payload)
     cache = {p["id"]: get_prop(p, "Ngày cập nhật") for p in all_pages if get_prop(p, "Ngày cập nhật")}
     save_cache(cache)
-    print(f"--> Đã lưu trữ {len(cache)} phim vào bộ nhớ.")
+    print(f"--> Đã lưu trữ {len(cache)} phim.")
 
 @tasks.loop(minutes=10)
 async def check_new_anime():
     if not CHANNEL_ID: return
-    # Lấy toàn bộ phim Public
     all_pages = await fetch_all_pages({"filter": {"property": "Public", "checkbox": {"equals": True}}})
     if not all_pages: return
-    
     local_cache = load_cache()
     has_changes = False
     channel = client.get_channel(int(CHANNEL_ID))
     if not channel: return
-
     for page in all_pages:
         pid = page["id"]
         new_date = get_prop(page, "Ngày cập nhật")
-        
-        # Bỏ qua nếu không có ngày
         if not new_date: continue
-        
         old_date = local_cache.get(pid)
-
-        # Logic: Chưa có trong cache HOẶC Ngày mới khác ngày cũ
         if (pid not in local_cache) or (new_date != old_date):
             print(f"🔔 Update: {get_prop(page, 'Tên Romanji')}")
             web_link = f"{WEB_BASE_URL}/anime/{create_slug_url(get_prop(page, 'Tên Romanji'), pid)}"
             embed = await create_anime_embed(page, web_link)
-            
-            if pid not in local_cache: 
-                embed.set_author(name="🔥 Anime Mới!", icon_url="https://cdn-icons-png.flaticon.com/512/2965/2965358.png")
-            else: 
-                embed.set_author(name="🔄 Cập Nhật!", icon_url="https://cdn-icons-png.flaticon.com/512/1680/1680899.png")
-            
+            if pid not in local_cache: embed.set_author(name="🔥 Anime Mới!", icon_url="https://cdn-icons-png.flaticon.com/512/2965/2965358.png")
+            else: embed.set_author(name="🔄 Cập Nhật!", icon_url="https://cdn-icons-png.flaticon.com/512/1680/1680899.png")
             series = await get_series_list(get_prop(page, "Loạt phim"), get_prop(page, "Tên Romanji"))
             view = AnimeView(series)
-            
             await channel.send(embed=embed, view=view)
-            
             local_cache[pid] = new_date
             has_changes = True
-
     if has_changes: save_cache(local_cache)
 
-# --- COMMANDS ---
 class SeriesSelect(Select):
     def __init__(self, movies):
         options = [discord.SelectOption(label=m[:100]) for m in movies[:25]]
         super().__init__(placeholder="Cùng loạt phim", options=options)
     async def callback(self, itr):
         await itr.response.defer()
-        # (Giản lược logic view cho ngắn gọn, bạn dùng lại logic cũ ở đây nếu cần)
 
 class AnimeView(View):
     def __init__(self, movies):
@@ -192,6 +189,9 @@ class AnimeView(View):
 @client.tree.command(name="timphim")
 async def timphim(itr: discord.Interaction, ten: str):
     await itr.response.defer()
-    await itr.followup.send(f"Đang tìm: {ten}") # Code placeholder
+    await itr.followup.send(f"Đang tìm: {ten}")
 
-client.run(TOKEN)
+# --- START ---
+if __name__ == "__main__":
+    keep_alive() # Chạy web server trước
+    client.run(TOKEN) # Chạy bot sau
