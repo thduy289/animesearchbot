@@ -243,7 +243,7 @@ async def check_new_anime():
             if page_id not in local_cache:
                 embed.set_author(name="🔥 Anime Mới Tinh!", icon_url="https://cdn-icons-png.flaticon.com/512/2965/2965358.png")
             else:
-                embed.set_author(name="🔄 Cập Nhật Mới!", icon_url="https://cdn-icons-png.flaticon.com/512/1680/1680899.png")
+                embed.set_author(name="🆕 Cập Nhật Mới!", icon_url="https://cdn-icons-png.flaticon.com/512/1680/1680899.png")
             
             series_name = get_prop(page, "Loạt phim")
             series_list = await get_series_list(series_name, ten_phim)
@@ -399,3 +399,4 @@ if __name__ == "__main__":
         client.run(TOKEN)
     except Exception as e:
         print(f"Lỗi khởi chạy: {e}")
+
