@@ -5,6 +5,7 @@ import random
 import re
 import json
 import unicodedata
+from datetime import datetime, timedelta, timezone # <--- THÊM MỚI
 from discord import app_commands
 from discord.ext import tasks
 from discord.ui import View, Button, Select
@@ -66,7 +67,7 @@ class MyClient(discord.Client):
 client = MyClient()
 
 # ==========================================
-# PHẦN 3: LOGIC NOTION
+# PHẦN 3: LOGIC NOTION & XỬ LÝ NGÀY
 # ==========================================
 
 async def fetch_notion(payload):
@@ -151,6 +152,44 @@ def create_slug_url(title, page_id):
     suffix = page_id[-4:] 
     return f"{slug}-{suffix}"
 
+# --- HÀM MỚI: KIỂM TRA ĐỘ LỆCH THỜI GIAN ---
+def is_recently_updated(last_edited_str, user_update_str):
+    """
+    So sánh Last Edited Time (Notion) với Ngày cập nhật (User).
+    Nếu lệch nhau dưới 5 phút -> Trả về True (Nghĩa là bạn vừa cập nhật ngày).
+    """
+    if not last_edited_str or not user_update_str:
+        return False
+
+    try:
+        # 1. Xử lý Last Edited (UTC Notion) -> Chuyển sang giờ VN (UTC+7)
+        last_edited_utc = datetime.fromisoformat(last_edited_str.replace("Z", "+00:00"))
+        last_edited_vn = last_edited_utc.astimezone(timezone(timedelta(hours=7)))
+
+        # 2. Xử lý Ngày cập nhật (User nhập)
+        try:
+            # Dạng: January 31, 2026 21:09
+            user_date = datetime.strptime(user_update_str, "%B %d, %Y %H:%M")
+            user_date = user_date.replace(tzinfo=timezone(timedelta(hours=7)))
+        except ValueError:
+            # Dạng ISO: 2026-01-31...
+            if "T" in user_update_str:
+                user_date = datetime.fromisoformat(user_update_str)
+                if user_date.tzinfo is None:
+                    user_date = user_date.replace(tzinfo=timezone(timedelta(hours=7)))
+            else:
+                return False
+
+        # 3. Tính độ lệch (Giây)
+        diff_seconds = abs((last_edited_vn - user_date).total_seconds())
+
+        # Lệch dưới 300 giây (5 phút) -> OK
+        return diff_seconds < 300 
+
+    except Exception as e:
+        print(f"⚠️ Lỗi so sánh ngày: {e}")
+        return False
+
 async def get_series_list(series_name, current_movie_name):
     if series_name in ["Không có", "N/A", None]:
         return []
@@ -202,7 +241,7 @@ async def create_anime_embed(page, web_link):
     return embed
 
 # ==========================================
-# PHẦN 4: AUTO SYNC
+# PHẦN 4: AUTO SYNC & CHECK NEW (ĐÃ SỬA)
 # ==========================================
 
 async def sync_initial_data():
@@ -219,27 +258,50 @@ async def sync_initial_data():
 @tasks.loop(minutes=10)
 async def check_new_anime():
     if not CHANNEL_ID: return
+    # Lấy danh sách phim Public
     payload_filter = { "filter": { "property": "Public", "checkbox": { "equals": True } } }
+    
     all_pages = await fetch_all_pages(payload_filter)
     if not all_pages: return
 
     local_cache = load_cache()
     has_changes = False
     channel = client.get_channel(int(CHANNEL_ID))
+    
     if not channel: return
 
     for page in all_pages:
         page_id = page["id"]
-        new_date = get_prop(page, "Ngày cập nhật")
-        if not new_date: continue
+        
+        # Lấy 2 mốc thời gian
+        last_edited = page["last_edited_time"]  # Hệ thống tự sinh
+        user_update = get_prop(page, "Ngày cập nhật") # Bạn nhập
+        
+        if not user_update: continue
 
+        # === LOGIC MỚI: SO SÁNH LAST EDITED vs NGÀY CẬP NHẬT ===
+        is_fresh_update = is_recently_updated(last_edited, user_update)
+        
+        # Nếu không trùng khớp (nghĩa là sửa lặt vặt hoặc bật public phim cũ)
+        if not is_fresh_update:
+            # Vẫn cập nhật cache để dữ liệu luôn mới
+            if local_cache.get(page_id) != user_update:
+                local_cache[page_id] = user_update
+                has_changes = True
+            continue 
+
+        # === NẾU TRÙNG KHỚP -> KIỂM TRA CACHE ĐỂ THÔNG BÁO ===
         old_date = local_cache.get(page_id)
-        if (page_id not in local_cache) or (new_date != old_date):
+        
+        if user_update != old_date:
+            print(f"🔔 Update hợp lệ: {get_prop(page, 'Tên Romanji')}")
+            
             ten_phim = get_prop(page, "Tên Romanji")
             slug_url = create_slug_url(ten_phim, page_id)
             web_link = f"{WEB_BASE_URL}/anime/{slug_url}"
             
             embed = await create_anime_embed(page, web_link)
+            
             if page_id not in local_cache:
                 embed.set_author(name="🔥 Anime Mới Tinh!", icon_url="https://cdn-icons-png.flaticon.com/512/2965/2965358.png")
             else:
@@ -250,14 +312,15 @@ async def check_new_anime():
             view = AnimeView(series_list)
             
             await channel.send(embed=embed, view=view)
-            local_cache[page_id] = new_date
+            
+            local_cache[page_id] = user_update
             has_changes = True
 
     if has_changes:
         save_cache(local_cache)
 
 # ==========================================
-# PHẦN 5: VIEW & INTERACTION
+# PHẦN 5: VIEW & INTERACTION (THÊM VIEW TÌM KIẾM)
 # ==========================================
 
 class SeriesSelect(Select):
@@ -311,11 +374,45 @@ class AnimePaginationView(View):
             self.current_page += 1
             await self.update_msg(interaction)
 
+# --- CLASS MỚI CHO TÌM KIẾM ---
+class SearchResultSelect(discord.ui.Select):
+    def __init__(self, results):
+        self.results_map = {page['id']: page for page in results}
+        options = []
+        for page in results[:25]:
+            p_id = page['id']
+            title = get_prop(page, "Tên Romanji")
+            label = title[:95] + "..." if len(title) > 95 else title
+            nam = get_prop(page, "Năm")
+            desc = f"Năm: {nam}" if nam != "N/A" else ""
+            options.append(discord.SelectOption(label=label, value=p_id, description=desc))
+        super().__init__(placeholder="Tìm thấy nhiều phim! Hãy chọn...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        selected_id = self.values[0]
+        page = self.results_map.get(selected_id)
+        if not page: return
+
+        ten_full = get_prop(page, "Tên Romanji")
+        slug = create_slug_url(ten_full, page["id"])
+        web_link = f"{WEB_BASE_URL}/anime/{slug}"
+        
+        embed = await create_anime_embed(page, web_link)
+        series_name = get_prop(page, "Loạt phim")
+        series_list = await get_series_list(series_name, ten_full)
+        await interaction.edit_original_response(embed=embed, view=AnimeView(series_list))
+
+class SearchView(discord.ui.View):
+    def __init__(self, results):
+        super().__init__(timeout=120)
+        self.add_item(SearchResultSelect(results))
+
 # ==========================================
 # PHẦN 6: COMMANDS
 # ==========================================
 
-@client.tree.command(name="timphim", description="Tìm kiếm anime")
+@client.tree.command(name="timphim", description="Tìm kiếm anime (Nhập chính xác)")
 async def timphim(interaction: discord.Interaction, ten_phim: str):
     await interaction.response.defer()
     payload = {
@@ -344,6 +441,49 @@ async def timphim(interaction: discord.Interaction, ten_phim: str):
         text_list = "\n".join([f"• {name}" for name in series_list])
         embed.description += f"\n**Cùng loạt phim:**\n{text_list}\n"
     await interaction.followup.send(embed=embed, view=AnimeView(series_list))
+
+# --- LỆNH TÌM MỚI (SMART SEARCH) ---
+@client.tree.command(name="tim", description="Tìm phim theo từ khóa (Có danh sách chọn)")
+async def tim(interaction: discord.Interaction, tu_khoa: str):
+    await interaction.response.defer()
+    
+    payload = {
+        "filter": {
+            "and": [
+                { "property": "Public", "checkbox": { "equals": True } },
+                { "or": [
+                    { "property": "Tên Romanji", "title": { "contains": tu_khoa } },
+                    { "property": "Tên tiếng Anh", "rich_text": { "contains": tu_khoa } }
+                ]}
+            ]
+        },
+        "sorts": [{ "property": "Tên Romanji", "direction": "ascending" }]
+    }
+    
+    data = await fetch_notion(payload)
+    
+    if not data or not data.get("results"):
+        await interaction.followup.send(f"❌ Không tìm thấy phim nào chứa từ: **{tu_khoa}**")
+        return
+
+    results = data["results"]
+
+    if len(results) == 1:
+        page = results[0]
+        ten_full = get_prop(page, "Tên Romanji")
+        slug = create_slug_url(ten_full, page["id"])
+        web_link = f"{WEB_BASE_URL}/anime/{slug}"
+        embed = await create_anime_embed(page, web_link)
+        series_name = get_prop(page, "Loạt phim")
+        series_list = await get_series_list(series_name, ten_full)
+        await interaction.followup.send(embed=embed, view=AnimeView(series_list))
+        return
+
+    view = SearchView(results)
+    count = len(results)
+    msg = f"🔎 Tìm thấy **{count}** phim khớp với '**{tu_khoa}**'. Hãy chọn bên dưới:"
+    if count > 25: msg += "\n*(Chỉ hiển thị 25 kết quả đầu tiên)*"
+    await interaction.followup.send(content=msg, view=view)
 
 @client.tree.command(name="ngaunhien", description="Random 1 bộ anime")
 async def ngaunhien(interaction: discord.Interaction):
@@ -391,12 +531,11 @@ async def mua(interaction: discord.Interaction, ten_mua: str):
         await interaction.followup.send(f"Không có phim nào mùa: {ten_mua}")
 
 # ==========================================
-# KHỞI CHẠY (QUAN TRỌNG)
+# KHỞI CHẠY
 # ==========================================
 if __name__ == "__main__":
-    keep_alive()  # Kích hoạt web server từ file keep_alive.py
+    keep_alive()
     try:
         client.run(TOKEN)
     except Exception as e:
         print(f"Lỗi khởi chạy: {e}")
-
